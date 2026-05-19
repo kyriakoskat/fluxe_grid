@@ -187,15 +187,15 @@ def run_stochastic_optimization(req: OptimizeRequest) -> dict:
         for s in S:
             model.constrs.add(model.p[ev_id, t0, s] == model.p_now[ev_id])
 
-    # Solve
-    solver = pyo.SolverFactory('highs')
-    results = solver.solve(model, tee=False)
+    # Solve using appsi_highs (requires highspy package)
+    solver = pyo.SolverFactory('appsi_highs')
+    results = solver.solve(model)
 
-    if results.solver.termination_condition not in [
+    if results.termination_condition not in [
         pyo.TerminationCondition.optimal,
         pyo.TerminationCondition.feasible,
     ]:
-        raise Exception(f"Solver status: {results.solver.termination_condition}")
+        raise Exception(f"Solver status: {results.termination_condition}")
 
     # Extract results
     obj_val = pyo.value(model.obj)
@@ -221,13 +221,15 @@ def run_stochastic_optimization(req: OptimizeRequest) -> dict:
             "delta_neg_kw": round(dn, 4),
         })
 
-    # SOC trajectories
+    # SOC trajectories + power per slot (avg across scenarios)
     soc_trajectories = []
     for ev_id in EVs:
-        traj = {"ev_id": ev_id, "soc": []}
+        traj = {"ev_id": ev_id, "soc": [], "p_kw": []}
         for t in T:
             avg_soc = sum(sc_map[s].probability * pyo.value(model.soc[ev_id, t, s]) for s in S)
+            avg_p = sum(sc_map[s].probability * pyo.value(model.p[ev_id, t, s]) for s in S)
             traj["soc"].append(round(avg_soc, 4))
+            traj["p_kw"].append(round(avg_p, 4))
         soc_trajectories.append(traj)
 
     # Cost breakdown
