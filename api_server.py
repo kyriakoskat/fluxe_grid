@@ -138,10 +138,12 @@ def run_stochastic_optimization(req: OptimizeRequest) -> dict:
                 constraints.append(soc_vars[j][i][t] == soc_prev + ev.eta * p_vars[j][i][t] * dt)
                 constraints.append(soc_vars[j][i][t] <= ev.capacity_kwh)
 
-                # Quadratic smoothing per EV per slot
+                # Linearised smoothing |Δp| (avoids 2-D expression issues with cp.square)
                 if t > 0:
-                    diff = p_vars[j][i][t] - p_vars[j][i][t - 1]
-                    cost_terms.append(prob * req.smoothing_coeff_eur * cp.square(diff))
+                    diff_abs = cp.Variable(nonneg=True)
+                    constraints.append(diff_abs >= p_vars[j][i][t] - p_vars[j][i][t - 1])
+                    constraints.append(diff_abs >= p_vars[j][i][t - 1] - p_vars[j][i][t])
+                    cost_terms.append(prob * req.smoothing_coeff_eur * diff_abs)
 
             dep = min(ev.departure_slot - 1, nT - 1)
             constraints.append(soc_vars[j][i][dep] + soc_slack[j][i] >= ev.soc_required_kwh)
