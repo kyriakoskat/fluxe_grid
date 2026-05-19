@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Any
 import math
+# cvxpy and numpy imported inside run_stochastic_optimization
 
 app = FastAPI(title="FlexGrid Optimization API")
 
@@ -80,185 +81,154 @@ def optimize(req: OptimizeRequest):
 
 
 def run_stochastic_optimization(req: OptimizeRequest) -> dict:
-    import pyomo.environ as pyo
+    import cvxpy as cp
+    import numpy as np
 
     T = list(range(req.num_time_slots))
+    nT = req.num_time_slots
     dt = req.delta_t_hours
     t0 = req.t0
     EVs = [ev.id for ev in req.evs_data]
+    nEV = len(EVs)
     ev_map = {ev.id: ev for ev in req.evs_data}
     S = [sc.id for sc in req.scenarios_data]
+    nS = len(S)
     sc_map = {sc.id: sc for sc in req.scenarios_data}
 
     dam = {int(k): v for k, v in req.dam_profile_kw.items()}
     imb_price = {int(k): v for k, v in req.imbalance_price_eur.items()}
     id_price = {int(k): v for k, v in req.intraday_price_eur.items()}
 
-    model = pyo.ConcreteModel()
+    # Variables
+    # p[ev, t, s], soc[ev, t, s], delta_pos[t,s], delta_neg[t,s], soc_slack[ev,s], p_now[ev]
+    p = cp.Variable((nEV, nT, nS), nonneg=True)          # power per EV per slot per scenario
+    soc = cp.Variable((nEV, nT, nS), nonneg=True)        # SOC per EV per slot per scenario
+    delta_pos = cp.Variable((nT, nS), nonneg=True)
+    delta_neg = cp.Variable((nT, nS), nonneg=True)
+    soc_slack = cp.Variable((nEV, nS), nonneg=True)
+    p_now = cp.Variable(nEV, nonneg=True)                # first-stage decisions
 
-    # Sets
-    model.T = pyo.Set(initialize=T)
-    model.EVs = pyo.Set(initialize=EVs)
-    model.S = pyo.Set(initialize=S)
+    ev_idx = {ev_id: i for i, ev_id in enumerate(EVs)}
+    sc_idx = {s_id: j for j, s_id in enumerate(S)}
 
-    # First-stage: p_now[ev] = power at t0 (fixed across all scenarios)
-    model.p_now = pyo.Var(model.EVs, within=pyo.NonNegativeReals)
+    constraints = []
+    cost = 0
 
-    # Second-stage: p[ev, t, s], soc[ev, t, s], delta_pos[t, s], delta_neg[t, s]
-    model.p = pyo.Var(model.EVs, model.T, model.S, within=pyo.NonNegativeReals)
-    model.soc = pyo.Var(model.EVs, model.T, model.S, within=pyo.NonNegativeReals)
-    model.delta_pos = pyo.Var(model.T, model.S, within=pyo.NonNegativeReals)
-    model.delta_neg = pyo.Var(model.T, model.S, within=pyo.NonNegativeReals)
-    model.soc_slack = pyo.Var(model.EVs, model.S, within=pyo.NonNegativeReals)
+    for j, s_id in enumerate(S):
+        sc = sc_map[s_id]
+        prob = sc.probability
+        load_dev = {int(k): v for k, v in sc.load_deviation_kw.items()}
 
-    # Objective
-    def obj_rule(m):
-        cost = 0
-        for s in S:
-            prob = sc_map[s].probability
-            load_dev = {int(k): v for k, v in sc_map[s].load_deviation_kw.items()}
-            for t in T:
-                lam_imb = imb_price.get(t, 0.09)
-                lam_id = id_price.get(t, 0.05)
-                cost += prob * (lam_imb * (m.delta_pos[t, s] + m.delta_neg[t, s]) * dt
-                                + lam_id * (m.delta_pos[t, s] + m.delta_neg[t, s]) * dt)
-            for ev_id in EVs:
-                ev = ev_map[ev_id]
-                for t in T:
-                    cost += prob * ev.c_deg_eur_per_kwh * m.p[ev_id, t, s] * dt
-                cost += prob * req.slack_penalty_eur * m.soc_slack[ev_id, s]
-        # Smoothing: penalise changes between consecutive slots (first stage anchor)
-        for ev_id in EVs:
-            for t in T[1:]:
-                for s in S:
-                    prob = sc_map[s].probability
-                    cost += prob * req.smoothing_coeff_eur * (m.p[ev_id, t, s] - m.p[ev_id, t - 1, s]) ** 2
-        return cost
-
-    model.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
-
-    # Constraints
-    model.constrs = pyo.ConstraintList()
-
-    for s in S:
-        load_dev = {int(k): v for k, v in sc_map[s].load_deviation_kw.items()}
         for t in T:
-            total_p = sum(model.p[ev_id, t, s] for ev_id in EVs)
+            lam = imb_price.get(t, 0.09) + id_price.get(t, 0.05)
+            cost += prob * lam * (delta_pos[t, j] + delta_neg[t, j]) * dt
+
+            # Imbalance definition
+            total_p_t = cp.sum(p[:, t, j])
             base_load = dam.get(t, 0) + load_dev.get(t, 0)
-            model.constrs.add(total_p - base_load == model.delta_pos[t, s] - model.delta_neg[t, s])
+            constraints.append(total_p_t - base_load == delta_pos[t, j] - delta_neg[t, j])
 
-        for ev_id in EVs:
+            # Site power limit
+            constraints.append(total_p_t <= req.site_power_max_kw)
+
+        for i, ev_id in enumerate(EVs):
             ev = ev_map[ev_id]
+
+            cost += prob * req.slack_penalty_eur * soc_slack[i, j]
+
             for t in T:
+                # Degradation cost
+                cost += prob * ev.c_deg_eur_per_kwh * p[i, t, j] * dt
+
+                # Power limits
                 active = 1 if ev.arrival_slot <= t < ev.departure_slot else 0
-                model.constrs.add(model.p[ev_id, t, s] <= active * ev.p_max_kw)
-                model.constrs.add(model.p[ev_id, t, s] >= 0)
+                constraints.append(p[i, t, j] <= active * ev.p_max_kw)
 
-                # Site power limit
-                if t == T[0]:
-                    pass  # handled by site-level below
+                # SOC dynamics
+                soc_prev = ev.soc_init_kwh if t == 0 else soc[i, t - 1, j]
+                constraints.append(soc[i, t, j] == soc_prev + ev.eta * p[i, t, j] * dt)
+                constraints.append(soc[i, t, j] <= ev.capacity_kwh)
 
-            # SOC dynamics
-            for t in T:
-                if t == 0:
-                    soc_prev = ev.soc_init_kwh
-                else:
-                    soc_prev = model.soc[ev_id, t - 1, s]
-                model.constrs.add(
-                    model.soc[ev_id, t, s] == soc_prev + ev.eta * model.p[ev_id, t, s] * dt
-                )
-                model.constrs.add(model.soc[ev_id, t, s] <= ev.capacity_kwh)
+            # Final SOC requirement
+            dep = min(ev.departure_slot - 1, nT - 1)
+            constraints.append(soc[i, dep, j] + soc_slack[i, j] >= ev.soc_required_kwh)
 
-            # Final SOC requirement (with slack)
-            dep = ev.departure_slot - 1
-            dep = min(dep, req.num_time_slots - 1)
-            model.constrs.add(
-                model.soc[ev_id, dep, s] + model.soc_slack[ev_id, s] >= ev.soc_required_kwh
-            )
+        # Non-anticipativity: p[ev, t0, s] = p_now[ev]
+        for i in range(nEV):
+            constraints.append(p[i, t0, j] == p_now[i])
 
-        # Site power limit per slot
-        for t in T:
-            model.constrs.add(
-                sum(model.p[ev_id, t, s] for ev_id in EVs) <= req.site_power_max_kw
-            )
+    # Quadratic smoothing: sum over scenarios of prob * coeff * (p[t] - p[t-1])^2
+    for j, s_id in enumerate(S):
+        prob = sc_map[s_id].probability
+        for i in range(nEV):
+            for t in T[1:]:
+                cost += prob * req.smoothing_coeff_eur * cp.square(p[i, t, j] - p[i, t - 1, j])
 
-    # First-stage non-anticipativity: p[ev, t0, s] = p_now[ev] for all s
-    for ev_id in EVs:
-        for s in S:
-            model.constrs.add(model.p[ev_id, t0, s] == model.p_now[ev_id])
+    prob_obj = cp.Minimize(cost)
+    problem = cp.Problem(prob_obj, constraints)
+    problem.solve(solver=cp.OSQP, eps_abs=1e-4, eps_rel=1e-4, max_iter=10000)
 
-    # Solve using appsi_highs (requires highspy package)
-    solver = pyo.SolverFactory('appsi_highs')
-    results = solver.solve(model)
+    if problem.status not in ["optimal", "optimal_inaccurate"]:
+        raise Exception(f"Solver status: {problem.status}")
 
-    if results.termination_condition not in [
-        pyo.TerminationCondition.optimal,
-        pyo.TerminationCondition.feasible,
-    ]:
-        raise Exception(f"Solver status: {results.termination_condition}")
-
-    # Extract results
-    obj_val = pyo.value(model.obj)
+    obj_val = problem.value
 
     # p_now
-    p_now = {ev_id: round(pyo.value(model.p_now[ev_id]), 4) for ev_id in EVs}
+    p_now_val = {ev_id: round(float(p_now.value[i]), 4) for i, ev_id in enumerate(EVs)}
 
-    # Schedule summary (average across scenarios)
+    # Schedule summary
     schedule_summary = []
     for t in T:
-        total_p = sum(
-            sc_map[s].probability * pyo.value(model.p[ev_id, t, s])
-            for s in S for ev_id in EVs
+        total_p_t = sum(
+            sc_map[s_id].probability * float(p.value[i, t, j])
+            for j, s_id in enumerate(S)
+            for i in range(nEV)
         )
-        dam_t = dam.get(t, 0)
-        dp = sum(sc_map[s].probability * pyo.value(model.delta_pos[t, s]) for s in S)
-        dn = sum(sc_map[s].probability * pyo.value(model.delta_neg[t, s]) for s in S)
+        dp = sum(sc_map[s_id].probability * float(delta_pos.value[t, j]) for j, s_id in enumerate(S))
+        dn = sum(sc_map[s_id].probability * float(delta_neg.value[t, j]) for j, s_id in enumerate(S))
         schedule_summary.append({
             "slot": t,
-            "total_power_kw": round(total_p, 4),
-            "dam_kw": dam_t,
+            "total_power_kw": round(total_p_t, 4),
+            "dam_kw": dam.get(t, 0),
             "delta_pos_kw": round(dp, 4),
             "delta_neg_kw": round(dn, 4),
         })
 
-    # SOC trajectories + power per slot (avg across scenarios)
+    # SOC trajectories
     soc_trajectories = []
-    for ev_id in EVs:
+    for i, ev_id in enumerate(EVs):
         traj = {"ev_id": ev_id, "soc": [], "p_kw": []}
         for t in T:
-            avg_soc = sum(sc_map[s].probability * pyo.value(model.soc[ev_id, t, s]) for s in S)
-            avg_p = sum(sc_map[s].probability * pyo.value(model.p[ev_id, t, s]) for s in S)
+            avg_soc = sum(sc_map[s_id].probability * float(soc.value[i, t, j]) for j, s_id in enumerate(S))
+            avg_p = sum(sc_map[s_id].probability * float(p.value[i, t, j]) for j, s_id in enumerate(S))
             traj["soc"].append(round(avg_soc, 4))
             traj["p_kw"].append(round(avg_p, 4))
         soc_trajectories.append(traj)
 
     # Cost breakdown
-    dt_ = dt
     cost_imb = sum(
-        sc_map[s].probability * imb_price.get(t, 0.09) * (
-            pyo.value(model.delta_pos[t, s]) + pyo.value(model.delta_neg[t, s])
-        ) * dt_
-        for s in S for t in T
+        sc_map[s_id].probability * imb_price.get(t, 0.09) * (
+            float(delta_pos.value[t, j]) + float(delta_neg.value[t, j])
+        ) * dt
+        for j, s_id in enumerate(S) for t in T
     )
     cost_id = sum(
-        sc_map[s].probability * id_price.get(t, 0.05) * (
-            pyo.value(model.delta_pos[t, s]) + pyo.value(model.delta_neg[t, s])
-        ) * dt_
-        for s in S for t in T
+        sc_map[s_id].probability * id_price.get(t, 0.05) * (
+            float(delta_pos.value[t, j]) + float(delta_neg.value[t, j])
+        ) * dt
+        for j, s_id in enumerate(S) for t in T
     )
     cost_deg = sum(
-        sc_map[s].probability * ev_map[ev_id].c_deg_eur_per_kwh * pyo.value(model.p[ev_id, t, s]) * dt_
-        for s in S for ev_id in EVs for t in T
+        sc_map[s_id].probability * ev_map[ev_id].c_deg_eur_per_kwh * float(p.value[i, t, j]) * dt
+        for j, s_id in enumerate(S) for i, ev_id in enumerate(EVs) for t in T
     )
-    cost_slack = sum(
-        sc_map[s].probability * req.slack_penalty_eur * pyo.value(model.soc_slack[ev_id, s])
-        for s in S for ev_id in EVs
+    cost_slack_val = sum(
+        sc_map[s_id].probability * req.slack_penalty_eur * float(soc_slack.value[i, j])
+        for j, s_id in enumerate(S) for i in range(nEV)
     )
-    cost_smooth = max(0, obj_val - cost_imb - cost_id - cost_deg - cost_slack)
+    cost_smooth = max(0, obj_val - cost_imb - cost_id - cost_deg - cost_slack_val)
 
-    # Baseline (greedy) cost
     baseline = compute_baseline(req, dam, imb_price, id_price)
-
     savings = baseline["total"] - obj_val
     savings_pct = (savings / baseline["total"] * 100) if baseline["total"] > 0 else 0.0
 
@@ -269,8 +239,8 @@ def run_stochastic_optimization(req: OptimizeRequest) -> dict:
         "result_cost_intraday": round(cost_id, 4),
         "result_cost_degradation": round(cost_deg, 4),
         "result_cost_smoothing": round(cost_smooth, 4),
-        "result_cost_slack": round(cost_slack, 4),
-        "result_p_now_kw": p_now,
+        "result_cost_slack": round(cost_slack_val, 4),
+        "result_p_now_kw": p_now_val,
         "result_schedule_summary": schedule_summary,
         "result_soc_trajectories": soc_trajectories,
         "baseline_cost_total": round(baseline["total"], 4),
